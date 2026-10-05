@@ -489,10 +489,39 @@ def make_audit_excel(found, sections, corp_name, label):
 
 
 # ===== 3. 데이터 불러오기 =====
-@st.cache_data
-def load_corp():
-    con = sqlite3.connect("dart.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dart.db")
+
+
+def has_corp_table(con):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='corp_code'").fetchone() is not None
+
+
+def build_corp_db(con):
+    """dart.db가 없으면 OpenDART 고유번호 파일(corpCode.xml)을 받아 회사 목록 테이블을 만듦"""
+    r = requests.get("https://opendart.fss.or.kr/api/corpCode.xml",
+                     params={"crtfc_key": API_KEY}, timeout=60)
     try:
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+    except zipfile.BadZipFile:
+        m = re.search(rb"<message>(.*?)</message>", r.content, re.S)
+        raise RuntimeError("회사 목록을 받지 못했습니다. API 키를 확인하세요. "
+                           + (m.group(1).decode("utf-8", errors="ignore") if m else ""))
+    from lxml import etree
+    root = etree.fromstring(z.read(z.namelist()[0]))
+    rows = [((e.findtext("corp_code") or "").strip(), (e.findtext("corp_name") or "").strip(),
+             (e.findtext("stock_code") or "").strip(), (e.findtext("modify_date") or "").strip())
+            for e in root.iter("list")]
+    con.execute("CREATE TABLE corp_code (corp_code TEXT, corp_name TEXT, stock_code TEXT, modify_date TEXT)")
+    con.executemany("INSERT INTO corp_code VALUES (?, ?, ?, ?)", rows)
+    con.commit()
+
+
+@st.cache_data(show_spinner="회사 목록을 준비하는 중... (처음 한 번만, 1분 정도)")
+def load_corp():
+    con = sqlite3.connect(DB_PATH)
+    try:
+        if not has_corp_table(con):
+            build_corp_db(con)
         df = pd.read_sql("SELECT corp_code, corp_name, stock_code FROM corp_code "
                          "WHERE stock_code IS NOT NULL AND TRIM(stock_code) != ''", con)
     finally:
@@ -599,7 +628,11 @@ def value(df, label, basis="3개월"):
 
 
 # ===== 4. 화면 =====
-corp = load_corp()
+try:
+    corp = load_corp()
+except Exception as e:
+    st.error(f"회사 목록을 불러오지 못했습니다: {e}")
+    st.stop()
 q = st.text_input("회사 이름을 입력하세요", "오리온")
 cand = corp[corp["corp_name"].str.contains(q, case=False, na=False, regex=False)].reset_index(drop=True)
 if cand.empty:
