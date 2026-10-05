@@ -31,7 +31,16 @@ API_KEY = load_key()
 if not API_KEY:
     st.error("DART_API_KEY가 설정되지 않았습니다. README의 설정 방법을 확인하세요.")
     st.stop()
+
+
+def safe_err(e):
+    """에러 메시지에서 API 키를 가림"""
+    return str(e).replace(API_KEY, "****")
+
+
+AUTHOR = "made by inhyeok"
 st.title("📊 재무제표 검색")
+st.caption(AUTHOR)
 
 URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
 REPRT = {"사업보고서": "11011", "반기보고서": "11012", "1분기보고서": "11013", "3분기보고서": "11014"}
@@ -52,6 +61,7 @@ BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 HEAD = PatternFill("solid", fgColor="D9D9D9")
 SUB = PatternFill("solid", fgColor="F2F2F2")
 NUM = '#,##0;(#,##0);"-"'
+CREDIT = Font(name=FONT, size=9, italic=True, color="808080")   # 제작자 표시용 작은 회색 글씨
 MAJOR = ("자산", "부채", "자본", "유동자산", "비유동자산", "유동부채", "비유동부채")
 AMOUNT = re.compile(r"\(?-?\d{1,3}(,\d{3})*(\.\d+)?\)?")   # 1,000 미만 숫자도 인식
 SUBHEAD = re.compile(r"^(\d+\.\d+|\(\d+\)|[가-하]\.)\s*\S")
@@ -138,6 +148,7 @@ def write_sce(ws, part, cols, r):
 def make_excel(df, corp_name, div_label):
     wb = Workbook()
     wb.remove(wb.active)
+    wb.properties.creator = "inhyeok"
     for sj in df["sj_nm"].unique():
         part = df[df["sj_nm"] == sj]
         first = part.iloc[0]
@@ -152,6 +163,7 @@ def make_excel(df, corp_name, div_label):
         ws["A2"] = f"{first.get('thstrm_nm', '')} : {first.get('thstrm_dt', '')}"
         ws["A3"] = f"{first.get('frmtrm_nm', '')} : {first.get('frmtrm_dt', '')}"
         ws["A4"] = corp_name
+        ws["A5"], ws["A5"].font = AUTHOR, CREDIT
         if str(first.get("sj_div")) == "SCE":
             write_sce(ws, part, cols, 6)
             continue
@@ -348,7 +360,7 @@ def get_audit_tables(rcept_no, consolidated):
         r = requests.get("https://opendart.fss.or.kr/api/document.xml",
                          params={"crtfc_key": API_KEY, "rcept_no": rcept_no}, timeout=60)
     except requests.RequestException as e:
-        return {}, [], f"원문 요청 실패: {e}"
+        return {}, [], f"원문 요청 실패: {safe_err(e)}"
     try:
         z = zipfile.ZipFile(io.BytesIO(r.content))
     except zipfile.BadZipFile:
@@ -423,6 +435,7 @@ def safe_sheet_name(title, used):
 def make_audit_excel(found, sections, corp_name, label):
     wb = Workbook()
     wb.remove(wb.active)
+    wb.properties.creator = "inhyeok"
     used = {"목차"}
     link = Font(name=FONT, color="0563C1", underline="single")
 
@@ -430,6 +443,7 @@ def make_audit_excel(found, sections, corp_name, label):
     toc.sheet_view.showGridLines = False
     toc["B2"] = f"{corp_name} {label}"
     toc["B2"].font = Font(name=FONT, size=14, bold=True)
+    toc["B3"], toc["B3"].font = AUTHOR, CREDIT
     toc.column_dimensions["A"].width = 2
     toc.column_dimensions["B"].width = 60
     toc_row = 4
@@ -442,6 +456,7 @@ def make_audit_excel(found, sections, corp_name, label):
         ws["B2"] = f"{kind} ({label})"
         ws["B2"].font = Font(name=FONT, size=14, bold=True)
         ws["B3"] = corp_name
+        ws["B4"], ws["B4"].font = AUTHOR, CREDIT
         nospace = t.apply(lambda c: c.astype(str).str.replace(" ", ""))
         hdr_end = next((i for i in range(len(t)) if nospace.iloc[i].str.contains("과목").any()), 0)
         note_cols = {j for j in range(t.shape[1])
@@ -465,6 +480,7 @@ def make_audit_excel(found, sections, corp_name, label):
         ws["B2"].font = Font(name=FONT, size=12, bold=True)
         ws["B3"] = corp_name
         ws["B3"].font = Font(name=FONT, color="808080")
+        ws["B4"], ws["B4"].font = AUTHOR, CREDIT
         r, widest = 5, 1
         for typ, val in sec["items"]:
             if typ == "p":
@@ -522,7 +538,7 @@ def load_corp():
     try:
         if not has_corp_table(con):
             build_corp_db(con)
-        df = pd.read_sql("SELECT corp_code, corp_name, stock_code FROM corp_code "
+        df = pd.read_sql("SELECT corp_code, corp_name, stock_code, modify_date FROM corp_code "
                          "WHERE stock_code IS NOT NULL AND TRIM(stock_code) != ''", con)
     finally:
         con.close()
@@ -536,7 +552,7 @@ def get_fs(corp_code, year, reprt, div):
                                         "bsns_year": year, "reprt_code": reprt, "fs_div": div},
                            timeout=30).json()
     except (requests.RequestException, ValueError) as e:
-        return None, f"요청 실패: {e}"
+        return None, f"요청 실패: {safe_err(e)}"
     if res.get("status") != "000":
         return None, res.get("message")
     df = pd.DataFrame(res.get("list", []))
@@ -631,15 +647,23 @@ def value(df, label, basis="3개월"):
 try:
     corp = load_corp()
 except Exception as e:
-    st.error(f"회사 목록을 불러오지 못했습니다: {e}")
+    st.error(f"회사 목록을 불러오지 못했습니다: {safe_err(e)}")
     st.stop()
 q = st.text_input("회사 이름을 입력하세요", "오리온")
-cand = corp[corp["corp_name"].str.contains(q, case=False, na=False, regex=False)].reset_index(drop=True)
+q = q.strip()
+cand = corp[corp["corp_name"].str.contains(q, case=False, na=False, regex=False)].copy()
+nm, ql = cand["corp_name"].str.lower(), q.lower()
+cand["_r"] = (nm != ql).astype(int) + (~nm.str.startswith(ql)).astype(int)  # 0: 정확히 일치, 1: 시작, 2: 포함
+cand["_l"] = nm.str.len()
+cand = cand.sort_values(["_r", "_l", "modify_date"], ascending=[True, True, False]) \
+           .drop(columns=["_r", "_l"]).reset_index(drop=True)
 if cand.empty:
     st.warning("검색 결과가 없습니다.")
     st.stop()
 
 labels = cand["corp_name"] + " (" + cand["stock_code"] + ")"
+dup = cand["corp_name"].duplicated(keep=False)             # 같은 이름이 여러 개면 갱신 연도 표시
+labels[dup] = labels[dup] + " · 정보 갱신 " + cand.loc[dup, "modify_date"].str[:4] + "년"
 i = st.selectbox("회사 선택", range(len(cand)), format_func=lambda k: labels[k])
 code, name = cand.loc[i, "corp_code"], cand.loc[i, "corp_name"]
 
