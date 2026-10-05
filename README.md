@@ -1,6 +1,4 @@
 # dart-finance-search
-searching financial report data 
-# dart-finance-search
 
 DART(전자공시시스템) Open API로 상장사 재무제표를 검색하고,
 서식이 적용된 엑셀로 내려받는 Streamlit 웹앱입니다.
@@ -18,8 +16,14 @@ DART(전자공시시스템) Open API로 상장사 재무제표를 검색하고,
   섹션 경계를 인식해 연결/별도 주석이 섞이지 않도록 처리
 
 ## 실행 방법
-pip install -r requirements.txt
-DART_API_KEY 환경변수 설정 후
-streamlit run app.py
 
-※ 회사 목록(dart.db)은 DART 고유번호 파일(corpCode.xml)로 생성합니다.
+1. Python 3.10 이상 설치 (https://www.python.org, 설치 시 "Add Python to PATH" 체크)
+2. 이 페이지의 초록색 Code 버튼 → Download ZIP → 압축 해제
+3. DART API 키 발급 (https://opendart.fss.or.kr, 무료)
+4. 압축 푼 폴더에서 명령 프롬프트(cmd)를 열고 아래 입력
+
+   pip install -r requirements.txt
+   set DART_API_KEY=발급받은키
+   streamlit run app.py
+
+5. 브라우저가 자동으로 열리며 앱이 실행됩니다.
