@@ -1,4 +1,5 @@
 import difflib
+import html
 import io
 import os
 import re
@@ -6,6 +7,7 @@ import sqlite3
 import zipfile
 from datetime import date
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -73,6 +75,11 @@ SEP_BS = re.compile(r"^\d+\s*-\s*\d+\s*\.\s*재무상태표")          # 연결 
 SECTION_NOTE = re.compile(r"재무제표\s*주석\s*$")                     # '3. 연결재무제표 주석' 섹션 제목
 NOTE_HEAD = re.compile(r"^(?:주\s*석\s*)?(\d{1,2})\s*[\.．)]\s*(?=[^\d\s])")   # 1. / 1) / 1 . / 주석 1.
 NUM_ONLY = re.compile(r"^(?:주\s*석\s*)?\d{1,2}\s*[\.．)]$")                    # "1." 만 따로 떨어진 줄
+# 주석 제목 뒤에 본문이 붙어 나올 때 나눌 위치: (1) / 1) / ① / 가.  또는 본문 첫머리에 자주 오는 말
+SUB_START = re.compile(r"\(\d+\)|\d+\)|[①-⑳]|(?<![가-힣])[가-하]\.\s")   # '다.'(문장 끝)는 제외
+BODY_WORD = re.compile(r"당기|전기|연결회사|지배기업|보고기간|연결실체")
+# 앞 문단 끝에 다음 주석 제목이 붙은 경우: "...참조).13. 유형자산" → 마침표·괄호 뒤의 'N. 한글' 앞에서 나눔
+MID_HEAD = re.compile(r"(?<=[\.\)\]」’'\"])\s*(?=\d{1,2}\s*\.\s*[가-힣])")
 
 
 # ===== 1. XBRL 재무제표 엑셀 =====
@@ -215,18 +222,42 @@ def to_number(s, strict=False):
     return s
 
 
+def span_of(cell, attr):
+    try:
+        return max(1, int(cell.get(attr, "1") or 1))
+    except ValueError:
+        return 1
+
+
+def head_rows(t):
+    """주석 표의 머리글 마지막 행: 숫자가 처음 나오는 행 바로 위까지, 첫 행의 세로 병합 범위까지"""
+    end = 0
+    for i in range(len(t)):
+        if any(isinstance(to_number(v, True), float) and str(v).strip() not in ("-", "－")
+               for v in t.iloc[i, 1:]):
+            end = max(i - 1, 0)
+            break
+    for r0, _, r1, _ in t.attrs.get("merges", []):
+        if r0 == 0:
+            end = max(end, r1)
+    return min(end, len(t) - 1)
+
+
 def read_items(text):
     """원문을 위에서부터 읽어 ('p', 한 줄 문장) 또는 ('table', 표)를 순서대로 돌려줌"""
     text = re.sub(r"<\?xml[^>]*\?>", "", text)
     text = re.sub(r"<(/?)T[EU](\s|>)", r"<\1TD\2", text)
     text = re.sub(r"<TITLE\b[^>]*>", "<P>", text)              # 섹션 제목도 문장으로 읽기
     text = re.sub(r"</TITLE\s*>", "</P>", text)
+    text = re.sub(r"&cr;", "<BR/>", text, flags=re.I)    # DART 원문의 줄바꿈 표시(&cr;) → 줄바꿈
     doc = lh.document_fromstring(text)
     for br in doc.iter("br"):
         br.tail = "\n" + (br.tail or "")
     for sp in doc.iter("span"):
         if "B" in (sp.get("usermark") or ""):
             sp.tail = "\n" + (sp.tail or "")
+    for pe in doc.iter("p", "div", "li"):                         # 문단 경계 = 줄바꿈 (표 칸 안의 여러 문단이 붙지 않게)
+        pe.tail = "\n" + (pe.tail or "")
     items, pending = [], [""]
 
     def flush():
@@ -238,12 +269,99 @@ def read_items(text):
         s = " ".join(line.split())
         if not s:
             return
+        parts = MID_HEAD.split(s)
+        if len(parts) > 1:                           # 한 줄에 붙은 다음 주석 제목은 따로 떼기
+            for part in parts:
+                add_line(part)
+            return
         if pending[0]:                               # "1." 뒤에 제목이 오면 합치기
             s, pending[0] = f"{pending[0]} {s}", ""
         if NUM_ONLY.match(s):
             pending[0] = s
             return
         items.append(("p", s))
+
+    def own_rows(tbl):
+        """이 표 자신의 행만 (안에 들어 있는 다른 표의 행은 제외)"""
+        return [tr for tr in tbl.iter("tr") if next(tr.iterancestors("table"), None) is tbl]
+
+    def walk(node):
+        """표 안에 표가 들어 있는 '틀' 칸: 글은 문장으로, 안쪽 표는 표로 순서대로 꺼냄"""
+        buf = [node.text or ""]
+
+        def out_text():
+            for line in "".join(buf).split("\n"):
+                add_line(line)
+            buf.clear()
+
+        for child in node:
+            if not isinstance(child.tag, str):
+                buf.append(child.tail or "")
+                continue
+            if child.tag == "table":
+                out_text()
+                handle_table(child)
+            elif child.find(".//table") is not None:
+                out_text()
+                walk(child)
+            else:
+                buf.append(child.text_content())
+            buf.append(child.tail or "")
+        out_text()
+
+    def handle_table(el):
+        if el.find(".//table") is not None:          # 틀 역할의 바깥 표 → 칸마다 풀어서 읽기
+            for tr in own_rows(el):
+                for cell in tr:
+                    if cell.tag in ("td", "th"):
+                        walk(cell)
+            return
+        rows, merges, carry = [], [], {}             # carry: 열 번호 → 위 칸 rowspan으로 남은 행 수
+        for tr in el.iter("tr"):
+            row, c, r = [], 0, len(rows)
+            for cell in tr:
+                if cell.tag not in ("td", "th"):
+                    continue
+                while carry.get(c, 0) > 0:           # 위에서 내려온 병합 칸은 비워 두고 건너뜀
+                    carry[c] -= 1
+                    row.append("")
+                    c += 1
+                cs, rs = span_of(cell, "colspan"), span_of(cell, "rowspan")
+                row.append(" ".join(cell.text_content().split()))
+                row.extend([""] * (cs - 1))
+                if rs > 1:
+                    for k in range(c, c + cs):
+                        carry[k] = rs - 1
+                if cs > 1 or rs > 1:
+                    merges.append((r, c, r + rs - 1, c + cs - 1))
+                c += cs
+            last = max((k for k, v in carry.items() if v > 0), default=-1)
+            while c <= last:                         # 행 끝쪽의 병합 칸
+                if carry.get(c, 0) > 0:
+                    carry[c] -= 1
+                row.append("")
+                c += 1
+            if row:
+                rows.append(row)
+        if not rows:
+            return
+        cells = [c for r in rows for c in r if c]
+        joined = " ".join(cells)
+        filled = sum(1 for r in rows if any(r))
+        # 제목이 1행짜리 표(번호칸/제목칸 분리 포함)에 들어 있는 경우 → 문장으로 취급
+        if filled == 1 and joined and len(joined) <= 100 and not AMOUNT.search(joined):
+            add_line(joined)
+            return
+        # 1칸짜리 상자 표 → 줄 단위 문장으로 풀어줌
+        if len(cells) == 1:
+            for line in el.text_content().split("\n"):
+                add_line(line)
+            return
+        flush()
+        w = max(len(r) for r in rows)
+        t = pd.DataFrame([r + [""] * (w - len(r)) for r in rows])
+        t.attrs["merges"] = merges
+        items.append(("table", t))
 
     for el in doc.iter("p", "table"):
         if any(a.tag == "table" for a in el.iterancestors()):
@@ -252,36 +370,7 @@ def read_items(text):
             for line in el.text_content().split("\n"):
                 add_line(line)
             continue
-        rows = []
-        for tr in el.iter("tr"):
-            row = []
-            for cell in tr:
-                if cell.tag not in ("td", "th"):
-                    continue
-                row.append(" ".join(cell.text_content().split()))
-                try:
-                    span = int(cell.get("colspan", "1") or 1)
-                except ValueError:
-                    span = 1
-                row.extend([""] * (span - 1))
-            if row:
-                rows.append(row)
-        if not rows:
-            continue
-        cells = [c for r in rows for c in r if c]
-        joined = " ".join(cells)
-        # 제목이 1행짜리 표(번호칸/제목칸 분리 포함)에 들어 있는 경우 → 문장으로 취급
-        if len(rows) == 1 and joined and len(joined) <= 100 and not AMOUNT.search(joined):
-            add_line(joined)
-            continue
-        # 1칸짜리 상자 표 → 줄 단위 문장으로 풀어줌
-        if len(cells) == 1:
-            for line in el.text_content().split("\n"):
-                add_line(line)
-            continue
-        flush()
-        w = max(len(r) for r in rows)
-        items.append(("table", pd.DataFrame([r + [""] * (w - len(r)) for r in rows])))
+        handle_table(el)
     flush()
     return items
 
@@ -294,7 +383,7 @@ def classify(t):
     head = "".join(t.iloc[:4].values.ravel()).replace(" ", "")
     if "자산총계" in first and ("부채총계" in first or "자본총계" in first):
         return "재무상태표"
-    if "영업활동현금흐름" in first and "투자활동" in first:
+    if re.search(r"영업활동(으로인한)?현금흐름", first) and "투자활동" in first:
         return "현금흐름표"
     if "기초" in first and ("자본금" in head or "이익잉여금" in head):
         return "자본변동표"
@@ -303,6 +392,19 @@ def classify(t):
     if ("매출액" in first or "영업수익" in first) and ("영업이익" in first or "당기순" in first):
         return "손익계산서"
     return None
+
+
+def split_head(val, start):
+    """'28. 금융수익과 금융비용(1) 당기와...'처럼 제목과 본문이 붙은 줄을 (제목, 본문)으로 나눔"""
+    sub = SUB_START.search(val, start)
+    if sub and sub.start() - start <= 40:
+        cut = sub.start()
+    elif len(val) > 20:
+        word = BODY_WORD.search(val, start + 2)
+        cut = word.start() if word and word.start() - start <= 40 else min(len(val), start + 30)
+    else:
+        return val, ""
+    return val[:cut].strip(), val[cut:].strip()
 
 
 def split_audit(items, tol=0, body=False, consolidated=False):
@@ -322,9 +424,13 @@ def split_audit(items, tol=0, body=False, consolidated=False):
                 continue
             m = NOTE_HEAD.match(val) if found else None
             nxt = len(sections) + 1
-            if m and len(val) <= 100 and nxt <= int(m.group(1)) <= nxt + tol:
-                title = re.sub(r"^주\s*석\s*", "", val).rstrip(" :：")
-                cur = {"title": title, "items": []}
+            num = int(m.group(1)) if m else 0
+            dot = bool(m) and not m.group(0).rstrip().endswith(")")
+            # 짧은 줄은 번호 범위 안이면 제목으로, 긴 줄(제목+본문이 붙은 경우)은 'N.' 형식이고 다음 번호일 때만
+            if m and ((len(val) <= 100 and nxt <= num <= nxt + tol) or (dot and num == nxt)):
+                title, rest = split_head(val, m.end())
+                title = re.sub(r"^주\s*석\s*", "", title).rstrip(" :：")
+                cur = {"title": title, "items": [("p", rest)] if rest else []}
                 sections.append(cur)
             elif cur is not None:
                 cur["items"].append(("p", val))
@@ -393,14 +499,15 @@ def get_audit_tables(rcept_no, consolidated):
         items = cut_to_statements(items, consolidated)
     opt = {"body": is_body, "consolidated": consolidated}
     found, sections, after = split_audit(items, **opt)             # 1차: 엄격한 번호 순서
-    if not sections:
-        found, sections, after = split_audit(items, tol=3, **opt)  # 2차: 번호 누락 허용
+    loose = split_audit(items, tol=3, **opt)                       # 2차: 번호 누락 허용
+    if len(loose[1]) > len(sections):                              # 중간 번호를 못 찾아 끊겼으면 2차 결과 사용
+        found, sections, after = loose
     if not sections and after:                              # 3차: 통째로 한 시트에 담기
         sections = [{"title": "주석(전체)", "items": after}]
     return found, sections, None
 
 
-def write_table(ws, t, start_row, hdr_end, note_cols, strict, col0=1):
+def write_table(ws, t, start_row, hdr_end, note_cols, strict, col0=1, merges=()):
     for i in range(len(t)):
         is_head = i <= hdr_end
         name0 = str(t.iat[i, 0])
@@ -419,14 +526,22 @@ def write_table(ws, t, start_row, hdr_end, note_cols, strict, col0=1):
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             else:
                 cell.font = Font(name=FONT, bold=major)
+    taken = set()
+    for r0, c0, r1, c1 in merges:                    # 원문의 병합 칸 그대로
+        r1, c1 = min(r1, len(t) - 1), min(c1, t.shape[1] - 1)
+        area = {(a, b) for a in range(r0, r1 + 1) for b in range(c0, c1 + 1)}
+        if len(area) > 1 and not (area & taken):     # 겹치는 병합은 엑셀 오류가 나므로 건너뜀
+            taken |= area
+            ws.merge_cells(start_row=start_row + r0, start_column=col0 + c0,
+                           end_row=start_row + r1, end_column=col0 + c1)
     return start_row + len(t)
 
 
 def safe_sheet_name(title, used):
-    name = re.sub(r"[\[\]\:\*\?\/\\]", "", title)[:31].strip() or "주석"
+    name = re.sub(r"[\[\]\:\*\?\/\\]", "", title)[:31].strip(" '") or "주석"   # 엑셀은 ' 로 시작·끝나는 시트 이름 불가
     base, k = name, 2
     while name in used:
-        name = f"{base[:28]}_{k}"
+        name = f"{base[:28].strip(" '")}_{k}"
         k += 1
     used.add(name)
     return name
@@ -449,6 +564,7 @@ def make_audit_excel(found, sections, corp_name, label):
     toc_row = 4
 
     for kind in found:                                  # 원문에 나온 순서 그대로
+        merges = found[kind].attrs.get("merges", [])
         t = found[kind].reset_index(drop=True)
         ws = wb.create_sheet(kind)
         used.add(kind)
@@ -461,7 +577,7 @@ def make_audit_excel(found, sections, corp_name, label):
         hdr_end = next((i for i in range(len(t)) if nospace.iloc[i].str.contains("과목").any()), 0)
         note_cols = {j for j in range(t.shape[1])
                      if nospace.iloc[:hdr_end + 1, j].str.contains("주석").any()}
-        write_table(ws, t, 5, hdr_end, note_cols, strict=False, col0=2)
+        write_table(ws, t, 5, hdr_end, note_cols, strict=False, col0=2, merges=merges)
         ws.column_dimensions["A"].width = 2
         ws.column_dimensions["B"].width = 40
         for j in range(3, t.shape[1] + 2):
@@ -488,8 +604,10 @@ def make_audit_excel(found, sections, corp_name, label):
                 cell.font = Font(name=FONT, bold=bool(SUBHEAD.match(val)))
                 r += 2                                   # 문장 사이에 빈 줄 하나
             else:
+                merges = val.attrs.get("merges", [])
                 t = val.reset_index(drop=True)
-                r = write_table(ws, t, r, 0, set(), strict=True, col0=2) + 1
+                t.attrs["merges"] = merges
+                r = write_table(ws, t, r, head_rows(t), set(), strict=True, col0=2, merges=merges) + 1
                 widest = max(widest, t.shape[1])
         ws.column_dimensions["A"].width = 2
         ws.column_dimensions["B"].width = 30
@@ -643,6 +761,192 @@ def value(df, label, basis="3개월"):
     return None
 
 
+# ===== 5개년 재무분석 데이터 =====
+# 항목: (찾을 재무제표, 표준 계정 ID, ID가 없을 때 쓸 계정명 패턴(공백 제거 후 비교))
+FIVE = {
+    "매출액": (("IS", "CIS"), ("ifrs-full_Revenue",), r"^(매출액|매출|영업수익|수익\(매출액\))$"),
+    "영업이익": (("IS", "CIS"), ("dart_OperatingIncomeLoss", "ifrs-full_ProfitLossFromOperatingActivities"),
+             r"^영업이익(\(손실\))?$"),
+    "당기순이익": (("IS", "CIS"), ("ifrs-full_ProfitLoss",), r"^(연결)?당기순이익(\(손실\))?$"),
+    "자산총계": (("BS",), ("ifrs-full_Assets",), r"^자산총계$"),
+    "유동자산": (("BS",), ("ifrs-full_CurrentAssets",), r"^유동자산$"),
+    "부채총계": (("BS",), ("ifrs-full_Liabilities",), r"^부채총계$"),
+    "자본총계": (("BS",), ("ifrs-full_Equity",), r"^자본총계$"),
+    "영업활동현금흐름": (("CF",), ("ifrs-full_CashFlowsFromUsedInOperatingActivities",), r"^영업활동.*현금흐름"),
+    "유형자산취득": (("CF",), ("ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",),
+               r"^유형자산의?취득"),
+    "무형자산취득": (("CF",), ("ifrs-full_PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities",),
+               r"^무형자산의?취득"),
+}
+
+
+def pick_amount(df, key, cols=("thstrm_amount",)):
+    """보고서 데이터에서 항목 금액 하나를 찾음 (ID 우선, 없으면 계정명). cols는 읽을 칸의 우선순위"""
+    if df is None:
+        return None
+    sj, ids, pat = FIVE[key]
+    part = df[df["sj_div"].isin(sj)]
+    rows = part[part["account_id"].isin(ids)]
+    if rows.empty:
+        nm = part["account_nm"].astype(str).str.replace(r"\s", "", regex=True)
+        rows = part[nm.str.match(pat)]
+    for c in cols:
+        if c in rows.columns:
+            v = pd.to_numeric(rows[c], errors="coerce").dropna()
+            if len(v):
+                return float(v.iloc[0])
+    return None
+
+
+def sub(a, b):
+    return None if a is None or b is None else a - b
+
+
+IS_KEYS = ("매출액", "영업이익", "당기순이익")
+BS_KEYS = ("자산총계", "유동자산", "부채총계", "자본총계")
+CF_KEYS = ("영업활동현금흐름", "유형자산취득")
+QTR = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}     # 분기 → 보고서 코드 (4분기 = 사업보고서)
+CUM = ("thstrm_add_amount", "thstrm_amount")                 # 누적 금액 (현금흐름표는 분기보고서도 누적)
+
+
+def year_values(corp_code, y, div):
+    fs, _ = get_fs(corp_code, str(y), "11011", div)
+    if fs is None:
+        return None
+    rec = {"기간": str(y)}
+    for k in IS_KEYS + BS_KEYS + CF_KEYS:
+        rec[k] = pick_amount(fs, k)
+    return rec
+
+
+def quarter_values(corp_code, y, q, div):
+    """한 분기의 3개월 금액. 4분기 손익 = 연간 − 3분기 누적, 현금흐름 = 이번 누적 − 직전 분기 누적"""
+    fs, _ = get_fs(corp_code, str(y), QTR[q], div)
+    if fs is None:
+        return None
+    before = get_fs(corp_code, str(y), QTR[q - 1], div)[0] if q > 1 else None
+    rec = {"기간": f"{y}/{q * 3:02d}"}
+    for k in IS_KEYS:
+        if q < 4:
+            rec[k] = pick_amount(fs, k)                                          # 3개월
+            rec[k + "_전년"] = pick_amount(fs, k, ("frmtrm_q_amount", "frmtrm_amount"))
+        else:
+            rec[k] = sub(pick_amount(fs, k), pick_amount(before, k, CUM))
+            rec[k + "_전년"] = sub(pick_amount(fs, k, ("frmtrm_amount",)), pick_amount(before, k, ("frmtrm_add_amount",)))
+    for k in BS_KEYS:
+        rec[k] = pick_amount(fs, k)
+    for k in CF_KEYS:
+        cur = pick_amount(fs, k, CUM)
+        rec[k] = cur if q == 1 else sub(cur, pick_amount(before, k, CUM))
+    return rec
+
+
+@st.cache_data(show_spinner="재무분석 데이터를 불러오는 중...")
+def analysis_data(corp_code, end_year, div, mode):
+    """최근 5개 기간(연간: 사업보고서 5개년 / 분기: 최근 5개 분기)을 모아 지표 계산 (억원, %)"""
+    recs, y = [], int(end_year)
+    if mode == "연간":
+        while len(recs) < 5 and y >= max(2015, int(end_year) - 7):      # OpenDART는 2015년부터 제공
+            r = year_values(corp_code, y, div)
+            if r:
+                recs.append(r)
+            y -= 1
+    else:
+        q, tries = 4, 0
+        while len(recs) < 5 and tries < 10 and y >= 2015:
+            r = quarter_values(corp_code, y, q, div)
+            if r:
+                recs.append(r)
+            tries += 1
+            q -= 1
+            if q == 0:
+                q, y = 4, y - 1
+    t = pd.DataFrame(recs[::-1])
+    if t.empty:
+        return t
+    t = t.set_index("기간").astype(float) / 1e8
+    t["CAPEX"] = t["유형자산취득"].abs()
+    t["잉여현금흐름"] = t["영업활동현금흐름"] - t["CAPEX"].fillna(0)
+    t["영업이익률"] = t["영업이익"] / t["매출액"] * 100
+    t["순이익률"] = t["당기순이익"] / t["매출액"] * 100
+    t["부채비율"] = t["부채총계"] / t["자본총계"] * 100
+
+    def growth(cur, prev):
+        return (cur - prev) / prev.abs() * 100                # 전기가 음수여도 방향이 맞도록 절댓값으로 나눔
+
+    for k, g in (("매출액", "매출액증가율"), ("영업이익", "영업이익증가율"), ("당기순이익", "순이익증가율")):
+        # 분기: 전년 같은 분기 대비 / 연간: 전년 대비
+        t[g] = growth(t[k], t[k + "_전년"]) if mode == "분기" else growth(t[k], t[k].shift(1))
+    for k, g in (("자산총계", "총자산증가율"), ("유동자산", "유동자산증가율"),
+                 ("부채총계", "부채증가율"), ("자본총계", "자본증가율")):
+        t[g] = growth(t[k], t[k].shift(1))                     # 분기: 직전 분기 말 대비
+    return t.reset_index()
+
+
+BAR_COLORS = ["#1f63d6", "#c8320f", "#7cbf1e"]
+LINE_COLORS = ["#a070dc", "#f59c1a", "#2bb5a6", "#666666"]
+
+
+def combo_chart(t, bars, lines=(), left="억원", right="%"):
+    """막대(왼쪽 축) + 꺾은선(오른쪽 축) 차트"""
+    x = alt.X("기간:N", title=None, axis=alt.Axis(labelAngle=0))
+    lb = t.melt("기간", list(bars), "항목", "값")
+    layers = [alt.Chart(lb).mark_bar().encode(
+        x=x, xOffset=alt.XOffset("항목:N", sort=list(bars)),
+        y=alt.Y("값:Q", title=f"[{left}]"),
+        color=alt.Color("항목:N", sort=list(bars), title=None,
+                        scale=alt.Scale(domain=list(bars), range=BAR_COLORS[:len(bars)]),
+                        legend=alt.Legend(orient="bottom")),
+        tooltip=["기간", "항목", alt.Tooltip("값:Q", format=",.0f")])]
+    if lines:
+        ll = t.melt("기간", list(lines), "항목", "값").dropna()
+        layers.append(alt.Chart(ll).mark_line(point=True).encode(
+            x=x, y=alt.Y("값:Q", title=f"[{right}]"),
+            color=alt.Color("항목:N", sort=list(lines), title=None,
+                            scale=alt.Scale(domain=list(lines), range=LINE_COLORS[:len(lines)]),
+                            legend=alt.Legend(orient="bottom")),
+            tooltip=["기간", "항목", alt.Tooltip("값:Q", format=",.1f")]))
+    return alt.layer(*layers).resolve_scale(y="independent", color="independent").properties(height=330)
+
+
+def title_tip(box, text, tip):
+    """그래프 제목 옆에 (?) 표시 — 커서를 올리면 계산 근거가 보임"""
+    tip = html.escape(tip).replace("\n", "&#10;")
+    box.markdown(f'**{html.escape(text)}** <span title="{tip}" style="cursor:help; display:inline-block; '
+                 'width:1.3em; height:1.3em; line-height:1.2em; text-align:center; border:1px solid #999; '
+                 'border-radius:50%; font-size:0.75em; color:#666;">?</span>', unsafe_allow_html=True)
+
+
+FORMULA = r"""| 분류 | 항목 | 계산 근거 |
+|---|---|---|
+| 손익 | 영업이익률 | 영업이익 ÷ 매출액 × 100 |
+| 손익 | 순이익률 | 당기순이익 ÷ 매출액 × 100 |
+| 손익 | 증가율 | (당기 − 비교기간) ÷ \|비교기간\| × 100 |
+| 재무상태 | 부채비율 | 부채총계 ÷ 자본총계 × 100 |
+| 현금흐름 | CAPEX | 유형자산의 취득 |
+| 현금흐름 | 잉여현금흐름 | 영업활동현금흐름 − CAPEX |
+| 분기 | 4분기 손익 | 사업보고서 연간 − 3분기보고서 누적 |
+| 분기 | 분기 현금흐름 | 이번 분기 누적 − 직전 분기 누적 |
+
+* 비교기간: 연간은 전년, 분기 손익은 전년 같은 분기, 분기 재무상태는 직전 분기 말
+* 비교기간 값이 음수여도 증감 방향이 맞도록 절댓값으로 나눕니다.
+* 출처: OpenDART 단일회사 전체 재무제표(XBRL)"""
+
+
+def growth_chart(t, cols, skip_first=True):
+    """증가율 꺾은선 차트 (skip_first: 첫 기간은 비교 대상이 없어 제외)"""
+    lg = (t.iloc[1:] if skip_first else t).melt("기간", list(cols), "항목", "값").dropna()
+    line = alt.Chart(lg).mark_line(point=True).encode(
+        x=alt.X("기간:N", title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("값:Q", title="[%]"),
+        color=alt.Color("항목:N", sort=list(cols), title=None,
+                        scale=alt.Scale(domain=list(cols), range=LINE_COLORS[:len(cols)]),
+                        legend=alt.Legend(orient="bottom")),
+        tooltip=["기간", "항목", alt.Tooltip("값:Q", format=",.1f")])
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#bbbbbb").encode(y="y:Q")
+    return (zero + line).properties(height=330)
+
+
 # ===== 4. 화면 =====
 try:
     corp = load_corp()
@@ -737,6 +1041,60 @@ d1.download_button("📥 엑셀 파일로 다운로드 (서식 포함)", make_ex
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 d2.download_button("CSV 다운로드 (원본 데이터)", df.to_csv(index=False).encode("utf-8-sig"),
                    file_name=f"{name}_{year}_{reprt}_{div}.csv", mime="text/csv")
+
+# ===== 재무분석 그래프 (연간 5개년 / 최근 5개 분기) =====
+st.divider()
+h1, h2, h3, h4 = st.columns([3, 1.2, 1.2, 0.6])
+h1.subheader("📈 재무분석")
+fdiv = h2.selectbox("기준", list(DIV), index=list(DIV).index(div), key="five_div",
+                    format_func=lambda d: f"K-IFRS({d})")
+mode = h3.radio("기간", ["연간", "분기"], horizontal=True, key="five_mode")
+with h4.popover("산식 ?"):
+    st.markdown(FORMULA)
+five = analysis_data(code, year, DIV[fdiv], mode)
+if len(five) < 2:
+    st.info("비교할 보고서가 2개 기간 이상 없어 그래프를 그릴 수 없습니다.")
+else:
+    is_q = mode == "분기"
+    unit = "분기 3개월 기준 (4분기 = 연간 − 3분기 누적)" if is_q else "사업보고서 기준"
+    st.caption(f"{five['기간'].iloc[0]}~{five['기간'].iloc[-1]} · {unit} · 단위: 억원, %")
+    g1, g2, g3 = st.tabs(["포괄손익계산서", "재무상태표", "현금흐름표"])
+    a, b = g1.columns(2)
+    title_tip(a, "주요재무항목",
+              ("매출액·영업이익·당기순이익: 분기별 3개월 금액 (4분기 = 연간 − 3분기 누적)\n" if is_q else
+               "매출액·영업이익·당기순이익: 각 연도 사업보고서 금액\n")
+              + "영업이익률 = 영업이익 ÷ 매출액 × 100\n순이익률 = 당기순이익 ÷ 매출액 × 100")
+    a.altair_chart(combo_chart(five, ["매출액", "영업이익", "당기순이익"], ["영업이익률", "순이익률"]),
+                   use_container_width=True)
+    title_tip(b, "수익성장성지표",
+              ("증가율 = (이번 분기 − 전년 같은 분기) ÷ |전년 같은 분기| × 100" if is_q else
+               "증가율 = (당기 − 전기) ÷ |전기| × 100")
+              + "\n대상: 매출액, 영업이익, 당기순이익")
+    b.altair_chart(growth_chart(five, ["매출액증가율", "영업이익증가율", "순이익증가율"], skip_first=not is_q),
+                   use_container_width=True)
+    a, b = g2.columns(2)
+    title_tip(a, "주요재무항목",
+              ("자산총계·부채총계: 각 분기 말 잔액\n" if is_q else "자산총계·부채총계: 각 연도 말 잔액\n")
+              + "부채비율 = 부채총계 ÷ 자본총계 × 100")
+    a.altair_chart(combo_chart(five, ["자산총계", "부채총계"], ["부채비율"]), use_container_width=True)
+    title_tip(b, "자산성장성지표",
+              ("증가율 = (이번 분기 말 − 직전 분기 말) ÷ |직전 분기 말| × 100" if is_q else
+               "증가율 = (당기말 − 전기말) ÷ |전기말| × 100")
+              + "\n대상: 자산총계, 유동자산, 부채총계, 자본총계")
+    b.altair_chart(growth_chart(five, ["총자산증가율", "유동자산증가율", "부채증가율", "자본증가율"]),
+                   use_container_width=True)
+    a, b = g3.columns(2)
+    title_tip(a, "영업활동현금흐름 & CAPEX",
+              ("분기 금액 = 이번 분기 누적 − 직전 분기 누적 (현금흐름표는 누적으로 공시)\n" if is_q else "")
+              + "CAPEX = 유형자산의 취득 (현금흐름표 투자활동)")
+    a.altair_chart(combo_chart(five, ["영업활동현금흐름", "CAPEX", "당기순이익"]), use_container_width=True)
+    title_tip(b, "잉여현금흐름", "잉여현금흐름 = 영업활동현금흐름 − CAPEX\nCAPEX = 유형자산의 취득")
+    b.altair_chart(combo_chart(five, ["잉여현금흐름"]), use_container_width=True)
+    with st.expander("숫자로 보기"):
+        show = five.set_index("기간")[["매출액", "영업이익", "당기순이익", "영업이익률", "순이익률",
+                                      "자산총계", "부채총계", "자본총계", "부채비율",
+                                      "영업활동현금흐름", "CAPEX", "잉여현금흐름"]].T
+        st.dataframe(show.style.format("{:,.1f}", na_rep="-"), use_container_width=True)
 
 # ===== 5. 감사보고서 양식 다운로드 =====
 st.divider()
